@@ -1,0 +1,768 @@
+# =============================================================================
+# Pipeline : Control-M JSON -> Mermaid (.mmd) -> SVG / PNG
+# =============================================================================
+#
+# Objectif
+# --------
+# Générer des diagrammes Mermaid à partir d'un export JSON Control-M, puis
+# produire éventuellement les versions SVG et PNG correspondantes.
+#
+# La pipeline prend en charge deux familles de sources JSON :
+#   - BUILD       : exports d'une chaîne ou d'un ensemble de chaînes ;
+#   - SMARTFOLDER : JSON des SmartFolders stockés par environnement.
+#
+# Déclenchement
+# -------------
+# La pipeline est volontairement manuelle :
+#   trigger = none
+#   pr      = none
+#
+# Elle se lance depuis "Run pipeline". Elle peut également être appelée
+# explicitement par une autre pipeline Azure DevOps.
+#
+# Sources JSON Control-M
+# ----------------------
+# targetSource détermine à la fois le type de source et l'environnement.
+#
+# BUILD :
+#   DEV BUILD  -> build/dev
+#   PPRD BUILD -> build/pep
+#   QAL BUILD  -> build/qaf
+#   PROD BUILD -> build/prd
+#
+# Ces dossiers contiennent généralement des exports JSON de chaînes Control-M,
+# par exemple CLM-XXX.json.
+#
+# SMARTFOLDER :
+#   DEV SMARTFOLDER  -> src/smartfolder/dev
+#   PPRD SMARTFOLDER -> src/smartfolder/pep
+#   QAL SMARTFOLDER  -> src/smartfolder/qaf
+#   PROD SMARTFOLDER -> src/smartfolder/prd
+#
+# jsonFile doit contenir uniquement le nom du fichier JSON, sans chemin.
+# Le dossier source est exclusivement déterminé par targetSource.
+#
+# Exemples :
+#   targetSource = DEV BUILD
+#   jsonFile     = CLM-237.json
+#   fichier lu   = build/dev/CLM-237.json
+#
+#   targetSource = QAL SMARTFOLDER
+#   jsonFile     = TEC_PAT_COD-UPD-QAF.json
+#   fichier lu   = src/smartfolder/qaf/TEC_PAT_COD-UPD-QAF.json
+#
+# Sécurité / validation du chemin
+# ------------------------------
+# jsonFile refuse :
+#   - les chemins avec "/" ou "\";
+#   - "..";
+#   - les fichiers sans extension .json.
+#
+# Cela évite qu'un nom saisi dans "Run pipeline" puisse sortir du dossier
+# associé à targetSource.
+#
+# Convertisseur Python
+# --------------------
+# Script attendu dans le repo :
+#   cipipeline/ctm_to_mermaid/ctm_json_to_mermaid.py
+#
+# La pipeline ne reconstruit pas les dépendances Control-M elle-même.
+# Le script Python analyse le JSON et génère les fichiers .mmd. Mermaid CLI
+# interprète ensuite ces .mmd pour produire le rendu graphique.
+#
+# Paramètres disponibles dans "Run pipeline"
+# -------------------------------------------
+# targetSource
+#   Source JSON à utiliser : 4 environnements BUILD + 4 SMARTFOLDER.
+#   Défaut : DEV BUILD.
+#
+# jsonFile
+#   Nom du fichier JSON à traiter, sans chemin.
+#   Défaut : sample.json.
+#
+# debugConditions
+#   false -> masque les noms des Events/conditions sur les flèches ;
+#   true  -> affiche les noms des Events/conditions sur les flèches.
+#   Défaut : false.
+#
+# generationMode
+#   global     -> génère uniquement le diagramme global du Folder ;
+#   subfolders -> génère uniquement un diagramme par SubFolder ;
+#   both       -> génère le global et les diagrammes des SubFolders.
+#   Défaut : both.
+#
+# layoutMode
+#   vertical -> favorise une lecture haut -> bas en ajoutant uniquement des
+#               contraintes graphiques transparentes entre composants
+#               indépendants ;
+#   auto     -> laisse Mermaid choisir librement le placement.
+#   Défaut : vertical.
+#
+# rendererMode
+#   dagre-d3      -> renderer utilisé par défaut et validé pour ce pipeline ;
+#   dagre-wrapper -> renderer alternatif pour comparaison de layout.
+#   Défaut : dagre-d3.
+#
+# rankSpacing
+#   Espacement vertical entre les rangs Mermaid.
+#   Plus la valeur augmente, plus le diagramme s'étire verticalement.
+#   Défaut : 30 px.
+#
+# nodeSpacing
+#   Espacement entre les nœuds placés sur un même rang.
+#   Il agit principalement sur l'espacement horizontal.
+#   Défaut : 45 px.
+#
+# pngViewportHeight
+#   Hauteur maximale du viewport Chromium utilisé pour rasteriser un PNG.
+#   Valeur acceptée par la pipeline : de 200 à 10000 px.
+#   Défaut : 1200 px.
+#
+#   IMPORTANT :
+#   - ce paramètre ne limite pas la hauteur finale du graphe ;
+#   - il ne redimensionne pas le SVG ;
+#   - il ne modifie pas la taille des textes ;
+#   - au-delà de cette hauteur, fullPage capture quand même tout le document.
+#
+#   Ce réglage sert principalement à limiter la taille du viewport Chromium
+#   pour les très grands graphes et donc à garder un rendu plus stable.
+#
+# renderSvg
+#   true  -> conserve les fichiers SVG dans l'artifact ;
+#   false -> ne conserve pas les SVG.
+#
+#   Si renderSvg=false et renderPng=true, un SVG intermédiaire est quand même
+#   généré pour fabriquer le PNG, puis supprimé.
+#   Défaut : true.
+#
+# renderPng
+#   true  -> génère les PNG à partir des SVG ;
+#   false -> ne génère pas de PNG.
+#   Défaut : true.
+#
+# Chaîne de rendu
+# ---------------
+# Mermaid n'est exécuté qu'une seule fois par diagramme :
+#
+#   JSON -> Python -> MMD -> Mermaid CLI -> SVG -> Chromium/Puppeteer -> PNG
+#
+# Le PNG est rasterisé à partir du SVG déjà généré. Mermaid/Dagre ne recalcule
+# donc pas une deuxième fois le layout pour le PNG.
+#
+# Conséquences :
+#   - SVG et PNG utilisent le même layout ;
+#   - la largeur Chromium est ajustée à la largeur réelle du SVG ;
+#   - cela évite la troncature horizontale des grands diagrammes ;
+#   - fullPage permet de capturer les diagrammes très hauts ;
+#   - deviceScaleFactor=2 améliore la netteté du PNG sans changer les proportions.
+#
+# Chromium est utilisé plutôt qu'un convertisseur SVG classique car les SVG
+# Mermaid peuvent contenir des foreignObject pour les labels HTML.
+#
+# Version de rendu
+# ----------------
+# L'image Mermaid CLI est volontairement figée :
+#   ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.16.1
+#
+# Cela évite qu'une mise à jour implicite de mermaid-cli modifie le rendu d'un
+# run à l'autre.
+#
+# Artifact
+# --------
+# Artifact publié :
+#   controlm-mermaid-diagrams
+#
+# Il contient :
+#   - les .mmd générés ;
+#   - les .svg si renderSvg=true ;
+#   - les .png si renderPng=true ;
+#   - generation-info.txt.
+#
+# generation-info.txt conserve notamment :
+#   - le build Azure DevOps et le commit ;
+#   - la source et le JSON utilisés ;
+#   - les paramètres de génération ;
+#   - la version Mermaid CLI ;
+#   - les informations de rasterisation PNG.
+# =============================================================================
+
+trigger: none
+pr: none
+
+parameters:
+  - name: targetSource
+    displayName: Source JSON Control-M
+    type: string
+    default: DEV BUILD
+    values:
+      - DEV BUILD
+      - PPRD BUILD
+      - QAL BUILD
+      - PROD BUILD
+      - DEV SMARTFOLDER
+      - PPRD SMARTFOLDER
+      - QAL SMARTFOLDER
+      - PROD SMARTFOLDER
+
+  - name: jsonFile
+    displayName: Nom du fichier JSON Control-M
+    type: string
+    default: sample.json
+
+  # Affiche les Events/conditions sur les flèches uniquement pour le diagnostic.
+  - name: debugConditions
+    displayName: "Mode debug : afficher les Events / conditions sur les flèches"
+    type: boolean
+    default: false
+
+  # Sélectionne le périmètre de génération des fichiers .mmd.
+  - name: generationMode
+    displayName: Génération Mermaid
+    type: string
+    default: both
+    values:
+      - global
+      - subfolders
+      - both
+
+  # "vertical" favorise une lecture haut -> bas sans créer de dépendance métier.
+  - name: layoutMode
+    displayName: Disposition du diagramme
+    type: string
+    default: vertical
+    values:
+      - vertical
+      - auto
+
+  # Le renderer est inscrit dans l'en-tête Mermaid de chaque .mmd.
+  - name: rendererMode
+    displayName: Renderer Mermaid
+    type: string
+    default: dagre-d3
+    values:
+      - dagre-d3
+      - dagre-wrapper
+
+  # Distance verticale entre deux rangs du graphe Mermaid.
+  - name: rankSpacing
+    displayName: Espacement vertical Mermaid (px)
+    type: number
+    default: 30
+
+  # Distance entre les nœuds placés sur un même rang Mermaid.
+  - name: nodeSpacing
+    displayName: Espacement horizontal Mermaid (px)
+    type: number
+    default: 45
+
+  # Hauteur maximale du viewport Chromium pendant la rasterisation PNG.
+  # Valeur autorisée : 200 à 10000 px. Cela ne limite pas la hauteur finale :
+  # fullPage capture l'intégralité du SVG même lorsqu'il dépasse cette valeur.
+  - name: pngViewportHeight
+    displayName: Hauteur max viewport PNG (px)
+    type: number
+    default: 1200
+
+  - name: renderSvg
+    displayName: Générer les SVG
+    type: boolean
+    default: true
+
+  - name: renderPng
+    displayName: Générer les PNG
+    type: boolean
+    default: true
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  # Repart d'un checkout propre afin d'éviter qu'un fichier résiduel d'un run
+  # précédent influence la génération.
+  - bash: |
+      if [[ "$(Build.SourceBranch)" != "refs/heads/integration" ]]; then
+        echo "ERROR: cette pipeline ne peut être exécutée que depuis la branche integration."
+        echo "Branche actuelle : $(Build.SourceBranch)"
+        exit 1
+      fi
+    displayName: "Check branch protection"
+
+  - checkout: self
+    clean: true
+
+  # Prépare Python 3.x. Le convertisseur n'installe aucune dépendance Python
+  # supplémentaire : il utilise uniquement la bibliothèque standard.
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.x'
+    displayName: "Setup Python"
+
+  # ---------------------------------------------------------------------------
+  # Résolution de la source JSON sélectionnée (BUILD ou SMARTFOLDER) et
+  # validation du fichier d'entrée.
+  # ---------------------------------------------------------------------------
+  - bash: |
+      set -euo pipefail
+
+      TARGET_SOURCE="${{ parameters.targetSource }}"
+      JSON_FILE="${{ parameters.jsonFile }}"
+
+      case "$TARGET_SOURCE" in
+        "DEV BUILD")
+          ENV_DIR="dev"
+          SOURCE_DIR="build/dev"
+          ;;
+        "PPRD BUILD")
+          ENV_DIR="pep"
+          SOURCE_DIR="build/pep"
+          ;;
+        "QAL BUILD")
+          ENV_DIR="qaf"
+          SOURCE_DIR="build/qaf"
+          ;;
+        "PROD BUILD")
+          ENV_DIR="prd"
+          SOURCE_DIR="build/prd"
+          ;;
+        "DEV SMARTFOLDER")
+          ENV_DIR="dev"
+          SOURCE_DIR="src/smartfolder/dev"
+          ;;
+        "PPRD SMARTFOLDER")
+          ENV_DIR="pep"
+          SOURCE_DIR="src/smartfolder/pep"
+          ;;
+        "QAL SMARTFOLDER")
+          ENV_DIR="qaf"
+          SOURCE_DIR="src/smartfolder/qaf"
+          ;;
+        "PROD SMARTFOLDER")
+          ENV_DIR="prd"
+          SOURCE_DIR="src/smartfolder/prd"
+          ;;
+        *)
+          echo "ERROR: source non supportée : $TARGET_SOURCE"
+          exit 1
+          ;;
+      esac
+
+      # jsonFile doit rester un simple nom de fichier.
+      # targetSource est l'unique paramètre autorisé à déterminer le dossier repo.
+      if [[ "$JSON_FILE" == */* || "$JSON_FILE" == *\\* || "$JSON_FILE" == *".."* ]]; then
+        echo "ERROR: jsonFile doit contenir uniquement un nom de fichier, sans chemin."
+        exit 1
+      fi
+
+      if [[ "$JSON_FILE" != *.json ]]; then
+        echo "ERROR: le fichier d'entrée doit avoir l'extension .json"
+        exit 1
+      fi
+
+      INPUT_JSON="$(Build.SourcesDirectory)/${SOURCE_DIR}/${JSON_FILE}"
+
+      echo "Source       : $TARGET_SOURCE"
+      echo "Dossier repo : $SOURCE_DIR"
+      echo "JSON         : $INPUT_JSON"
+
+      if [[ ! -f "$INPUT_JSON" ]]; then
+        echo
+        echo "ERROR: fichier JSON introuvable : $INPUT_JSON"
+        echo
+        echo "JSON disponibles dans $SOURCE_DIR :"
+        find "$(Build.SourcesDirectory)/$SOURCE_DIR" \
+          -maxdepth 1 -type f -name "*.json" -printf "  %f\n" 2>/dev/null | sort || true
+        exit 1
+      fi
+
+      echo "##vso[task.setvariable variable=CTM_ENV_DIR]$ENV_DIR"
+      echo "##vso[task.setvariable variable=CTM_SOURCE_DIR]$SOURCE_DIR"
+      echo "##vso[task.setvariable variable=CTM_INPUT_JSON]$INPUT_JSON"
+    displayName: "Resolve JSON source and input file"
+
+  # ---------------------------------------------------------------------------
+  # Conversion du JSON Control-M sélectionné en fichiers Mermaid (.mmd).
+  # ---------------------------------------------------------------------------
+  - bash: |
+      set -euo pipefail
+
+      SCRIPT="$(Build.SourcesDirectory)/cipipeline/ctm_to_mermaid/ctm_json_to_mermaid.py"
+      INPUT_JSON="$(CTM_INPUT_JSON)"
+      OUT_DIR="$(Build.ArtifactStagingDirectory)/mermaid-output"
+
+      SHOW_EVENTS="${{ parameters.debugConditions }}"
+      MODE="${{ parameters.generationMode }}"
+      LAYOUT="${{ parameters.layoutMode }}"
+      RENDERER="${{ parameters.rendererMode }}"
+      RANK_SPACING="${{ parameters.rankSpacing }}"
+      NODE_SPACING="${{ parameters.nodeSpacing }}"
+
+      if [[ ! -f "$SCRIPT" ]]; then
+        echo "ERROR: script Python introuvable : $SCRIPT"
+        exit 1
+      fi
+
+      rm -rf "$OUT_DIR"
+      mkdir -p "$OUT_DIR"
+
+      echo "=== GENERATION MERMAID ==="
+      echo "Input       : $INPUT_JSON"
+      echo "Source      : ${{ parameters.targetSource }} -> $(CTM_SOURCE_DIR)"
+      echo "Debug       : $SHOW_EVENTS"
+      echo "Mode        : $MODE"
+      echo "Layout      : $LAYOUT"
+      echo "Renderer    : $RENDERER"
+      echo "RankSpacing : $RANK_SPACING"
+      echo "NodeSpacing : $NODE_SPACING"
+      echo "Output      : $OUT_DIR"
+      # La version et le SHA256 permettent d'identifier exactement la version
+      # du convertisseur réellement exécutée par l'agent Azure DevOps.
+      echo
+      echo "Script version / checksum:"
+      python "$SCRIPT" --version
+      sha256sum "$SCRIPT"
+
+      python "$SCRIPT" \
+        "$INPUT_JSON" \
+        --show-events "$SHOW_EVENTS" \
+        --mode "$MODE" \
+        --layout "$LAYOUT" \
+        --renderer "$RENDERER" \
+        --rank-spacing "$RANK_SPACING" \
+        --node-spacing "$NODE_SPACING" \
+        --output-dir "$OUT_DIR"
+
+      MMD_COUNT="$(find "$OUT_DIR" -maxdepth 1 -type f -name "*.mmd" | wc -l)"
+
+      if [[ "$MMD_COUNT" -eq 0 ]]; then
+        echo "ERROR: aucun fichier .mmd n'a été généré."
+        exit 1
+      fi
+
+      echo
+      echo "=== MMD GENERATED ($MMD_COUNT) ==="
+      find "$OUT_DIR" -maxdepth 1 -type f -name "*.mmd" -printf "  %f\n" | sort
+    displayName: "Generate Mermaid MMD"
+
+  # ---------------------------------------------------------------------------
+  # Rendu des diagrammes.
+  #
+  # Principe :
+  #   1. Mermaid CLI calcule UNE seule fois le diagramme et produit le SVG ;
+  #   2. si un PNG est demandé, Chromium ouvre ce SVG statique et le rasterise.
+  #
+  # Le PNG n'est donc plus produit directement depuis le .mmd. Cela évite une
+  # deuxième exécution de Mermaid/Dagre et garantit que SVG et PNG utilisent
+  # exactement le même layout.
+  #
+  # Le script Node temporaire utilise Puppeteer déjà présent dans l'image
+  # officielle mermaid-cli. Il est créé dans $(Agent.TempDirectory) et n'est
+  # jamais publié dans l'artifact.
+  # ---------------------------------------------------------------------------
+  - bash: |
+      set -euo pipefail
+
+      OUT_DIR="$(Build.ArtifactStagingDirectory)/mermaid-output"
+      MERMAID_IMAGE="ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.16.1"
+      SVG_TO_PNG_JS="$(Agent.TempDirectory)/ctm_svg_to_png.mjs"
+
+      RENDER_SVG="${{ parameters.renderSvg }}"
+      RENDER_PNG="${{ parameters.renderPng }}"
+      PNG_VIEWPORT_HEIGHT="${{ parameters.pngViewportHeight }}"
+
+      echo "Mermaid CLI : $MERMAID_IMAGE"
+      echo "Renderer    : ${{ parameters.rendererMode }}"
+      echo "SVG         : $RENDER_SVG"
+      echo "PNG         : $RENDER_PNG"
+      echo "PNG viewport: $PNG_VIEWPORT_HEIGHT px"
+
+      if [[ "${RENDER_SVG,,}" != "true" && "${RENDER_PNG,,}" != "true" ]]; then
+        echo "SVG et PNG désactivés : conservation des .mmd uniquement."
+        exit 0
+      fi
+
+      if [[ ! "$PNG_VIEWPORT_HEIGHT" =~ ^[0-9]+$ ]] || [[ "$PNG_VIEWPORT_HEIGHT" -lt 200 ]] || [[ "$PNG_VIEWPORT_HEIGHT" -gt 10000 ]]; then
+        echo "ERROR: pngViewportHeight doit être un entier compris entre 200 et 10000."
+        exit 1
+      fi
+
+
+      # Même si renderSvg=false, un SVG intermédiaire est nécessaire lorsque
+      # renderPng=true. Il sera supprimé après rasterisation.
+      docker pull "$MERMAID_IMAGE"
+
+      # -----------------------------------------------------------------------
+      # Rasterisation SVG -> PNG.
+      #
+      # Pourquoi Chromium ?
+      # Les SVG Mermaid contiennent des foreignObject pour les labels HTML.
+      # Chromium les restitue comme le renderer Mermaid, contrairement à de
+      # nombreux convertisseurs SVG classiques qui peuvent perdre ces labels.
+      #
+      # Le SVG est inséré tel quel dans une page HTML, sa taille est forcée sur
+      # le viewBox, puis une capture est réalisée avec un facteur d'échelle 2.
+      # Aucun calcul Mermaid n'est exécuté à cette étape.
+      # -----------------------------------------------------------------------
+      if [[ "${RENDER_PNG,,}" == "true" ]]; then
+        cat > "$SVG_TO_PNG_JS" <<'NODE'
+      import fs from "node:fs/promises";
+      import puppeteer from "puppeteer";
+
+      const [svgPath, pngPath, scaleArg = "2", viewportHeightArg = "1200"] = process.argv.slice(2);
+
+      if (!svgPath || !pngPath) {
+        console.error("Usage: node ctm_svg_to_png.mjs <input.svg> <output.png> [scale]");
+        process.exit(2);
+      }
+
+      const scale = Number(scaleArg);
+      const maxViewportHeight = Number(viewportHeightArg);
+
+      if (!Number.isFinite(scale) || scale <= 0) {
+        console.error(`Invalid scale: ${scaleArg}`);
+        process.exit(2);
+      }
+
+      if (!Number.isFinite(maxViewportHeight) || maxViewportHeight < 200) {
+        console.error(`Invalid viewport height: ${viewportHeightArg}`);
+        process.exit(2);
+      }
+
+      const svgSource = await fs.readFile(svgPath, "utf8");
+
+      const browser = await puppeteer.launch({
+        executablePath: process.env.CHROME_BIN || "/usr/bin/chromium-browser",
+        headless: true,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+        ],
+      });
+
+      try {
+        const page = await browser.newPage();
+
+        // Viewport provisoire utilisé uniquement pour charger le SVG.
+        // Il est remplacé ensuite par un viewport adapté aux dimensions réelles.
+        await page.setViewport({
+          width: 800,
+          height: 600,
+          deviceScaleFactor: scale,
+        });
+
+        await page.setContent(
+          `<!doctype html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <style>
+                html, body {
+                  margin: 0;
+                  padding: 0;
+                  background: white;
+                }
+              </style>
+            </head>
+            <body>${svgSource}</body>
+          </html>`,
+          { waitUntil: "load" }
+        );
+
+        const dimensions = await page.$eval("svg", (svg) => {
+          const viewBox = svg.viewBox?.baseVal;
+
+          const width = Math.ceil(
+            viewBox?.width || svg.getBoundingClientRect().width
+          );
+          const height = Math.ceil(
+            viewBox?.height || svg.getBoundingClientRect().height
+          );
+
+          // Mermaid produit généralement un SVG avec width="100%" et max-width.
+          // On remplace ces dimensions relatives par celles du viewBox pour que
+          // la page HTML conserve exactement les dimensions logiques du SVG.
+          svg.setAttribute("width", String(width));
+          svg.setAttribute("height", String(height));
+          svg.style.width = `${width}px`;
+          svg.style.height = `${height}px`;
+          svg.style.maxWidth = "none";
+          svg.style.display = "block";
+
+          document.documentElement.style.width = `${width}px`;
+          document.documentElement.style.minWidth = `${width}px`;
+          document.documentElement.style.height = `${height}px`;
+          document.documentElement.style.minHeight = `${height}px`;
+          document.documentElement.style.overflow = "visible";
+
+          document.body.style.width = `${width}px`;
+          document.body.style.minWidth = `${width}px`;
+          document.body.style.height = `${height}px`;
+          document.body.style.minHeight = `${height}px`;
+          document.body.style.overflow = "visible";
+
+          return { width, height };
+        });
+
+        if (!dimensions.width || !dimensions.height) {
+          throw new Error("Unable to determine SVG dimensions");
+        }
+
+        // La largeur du viewport suit la largeur réelle du SVG.
+        // Cela évite la troncature des graphes globaux dépassant la largeur du
+        // viewport provisoire utilisé lors du chargement initial.
+        await page.setViewport({
+          width: Math.max(1, dimensions.width),
+          // Pour un petit diagramme, le viewport suit sa hauteur réelle afin
+          // d'éviter une zone blanche inutile. Pour un grand diagramme, la
+          // hauteur du viewport est plafonnée par pngViewportHeight.
+          // fullPage capture malgré tout toute la hauteur du document.
+          height: Math.max(1, Math.min(dimensions.height, maxViewportHeight)),
+          deviceScaleFactor: scale,
+        });
+
+        // Attend que le redimensionnement et les polices soient stabilisés.
+        await page.evaluate(async () => {
+          if (document.fonts?.ready) {
+            await document.fonts.ready;
+          }
+          await new Promise((resolve) =>
+            requestAnimationFrame(() =>
+              requestAnimationFrame(resolve)
+            )
+          );
+        });
+
+        // fullPage capture les dimensions réelles du document, y compris
+        // lorsque la hauteur du SVG dépasse celle du viewport Chromium.
+        await page.screenshot({
+          path: pngPath,
+          fullPage: true,
+          omitBackground: false,
+        });
+
+        console.log(
+          `PNG: ${pngPath} (${dimensions.width}x${dimensions.height} CSS px, scale=${scale}, maxViewportHeight=${maxViewportHeight})`
+        );
+      } finally {
+        await browser.close();
+      }
+      NODE
+      fi
+
+      FOUND_ANY=false
+
+      while IFS= read -r -d '' MMD_FILE; do
+        FOUND_ANY=true
+
+        FILE_NAME="$(basename "$MMD_FILE")"
+        STEM="${FILE_NAME%.mmd}"
+        SVG_FILE="$OUT_DIR/${STEM}.svg"
+        PNG_FILE="$OUT_DIR/${STEM}.png"
+
+        echo
+        echo "Rendering Mermaid: $FILE_NAME"
+
+        # Mermaid n'est exécuté qu'ici : le SVG devient la source graphique
+        # unique pour les éventuelles sorties raster.
+        docker run --rm \
+          --user "$(id -u):$(id -g)" \
+          -v "$OUT_DIR:/data" \
+          "$MERMAID_IMAGE" \
+          -i "$FILE_NAME" \
+          -o "${STEM}.svg"
+
+        if [[ ! -s "$SVG_FILE" ]]; then
+          echo "ERROR: SVG non généré ou vide : $SVG_FILE"
+          exit 1
+        fi
+
+        echo "  -> ${STEM}.svg"
+
+        if [[ "${RENDER_PNG,,}" == "true" ]]; then
+          echo "Rasterizing SVG -> PNG: ${STEM}.svg"
+
+          # Le script est monté sous /home/mermaidcli afin que Node résolve
+          # directement le module Puppeteer installé avec mermaid-cli.
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --entrypoint node \
+            -v "$OUT_DIR:/data" \
+            -v "$SVG_TO_PNG_JS:/home/mermaidcli/ctm_svg_to_png.mjs:ro" \
+            "$MERMAID_IMAGE" \
+            /home/mermaidcli/ctm_svg_to_png.mjs \
+            "/data/${STEM}.svg" \
+            "/data/${STEM}.png" \
+            2 \
+            "$PNG_VIEWPORT_HEIGHT"
+
+          if [[ ! -s "$PNG_FILE" ]]; then
+            echo "ERROR: PNG non généré ou vide : $PNG_FILE"
+            exit 1
+          fi
+
+          echo "  -> ${STEM}.png"
+        fi
+
+        # Si l'utilisateur ne souhaite que le PNG, le SVG a servi de fichier
+        # intermédiaire et peut être supprimé après conversion.
+        if [[ "${RENDER_SVG,,}" != "true" ]]; then
+          rm -f "$SVG_FILE"
+          echo "  -> SVG intermédiaire supprimé"
+        fi
+
+      done < <(find "$OUT_DIR" -maxdepth 1 -type f -name "*.mmd" -print0)
+
+      if [[ "$FOUND_ANY" == "false" ]]; then
+        echo "ERROR: aucun .mmd à convertir."
+        exit 1
+      fi
+
+      echo
+      echo "=== GENERATED FILES ==="
+      find "$OUT_DIR" -maxdepth 1 -type f \
+        \( -name "*.mmd" -o -name "*.svg" -o -name "*.png" \) \
+        -printf "  %f\n" | sort
+    displayName: "Render Mermaid SVG and rasterize PNG"
+
+  # ---------------------------------------------------------------------------
+  # Fichier de traçabilité livré avec l'artifact.
+  # Il enregistre les paramètres et versions utiles pour reproduire ou comparer
+  # un rendu ultérieurement.
+  # ---------------------------------------------------------------------------
+  - bash: |
+      set -euo pipefail
+
+      OUT_DIR="$(Build.ArtifactStagingDirectory)/mermaid-output"
+
+      cat > "$OUT_DIR/generation-info.txt" <<EOF
+      Azure DevOps build : $(Build.BuildNumber)
+      Build ID           : $(Build.BuildId)
+      Commit             : $(Build.SourceVersion)
+
+      Source             : ${{ parameters.targetSource }}
+      Repository folder  : $(CTM_SOURCE_DIR)
+      JSON               : ${{ parameters.jsonFile }}
+      Script             : cipipeline/ctm_to_mermaid/ctm_json_to_mermaid.py
+
+      Debug conditions   : ${{ parameters.debugConditions }}
+      Generation mode    : ${{ parameters.generationMode }}
+      Layout             : ${{ parameters.layoutMode }}
+      Renderer           : ${{ parameters.rendererMode }}
+      Rank spacing       : ${{ parameters.rankSpacing }}
+      Node spacing       : ${{ parameters.nodeSpacing }}
+      SVG                : ${{ parameters.renderSvg }}
+      PNG                : ${{ parameters.renderPng }}
+      PNG viewport max   : ${{ parameters.pngViewportHeight }}
+
+      Mermaid CLI        : ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.16.1
+      PNG source         : generated SVG
+      PNG rasterizer     : Chromium/Puppeteer (fullPage, dynamic SVG width, deviceScaleFactor=2)
+      EOF
+
+      cat "$OUT_DIR/generation-info.txt"
+    displayName: "Write generation metadata"
+
+  # Publication de l'ensemble des sorties dans un artifact Azure DevOps unique.
+  - publish: "$(Build.ArtifactStagingDirectory)/mermaid-output"
+    artifact: controlm-mermaid-diagrams
+    displayName: "Publish diagrams"
